@@ -1,0 +1,55 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "gjr-garch-x: GJR-GARCH Models with Exogenous Variance Regressors"
+version: 0.1.0
+date-released: 2025-01-01
+authors:
+  - family-names: Farzulla
+    given-names: Murad
+    email: murad@farzulla.org
+    orcid: https://orcid.org/0009-0002-7164-8704
+    affiliation: "King's College London"
+abstract: >-
+  A Python implementation of Glosten-Jagannathan-Runkle (1993) GARCH models
+  with support for exogenous regressors in the conditional variance equation.
+  Features Student-t innovations, quasi-maximum likelihood estimation, and
+  numerical Hessian-based inference. Designed for event studies, sentiment
+  analysis, and regime-dependent volatility modeling.
+keywords:
+  - GARCH
+  - GJR-GARCH
+  - Glosten-Jagannathan-Runkle
+  - volatility modeling
+  - econometrics
+  - time series
+  - financial econometrics
+  - event study
+  - exogenous regressors
+  - conditional variance
+license: MIT
+repository-code: "https://github.com/studiofarzulla/gjr-garch-x"
+url: "https://pypi.org/project/gjr-garch-x/"
+references:
+  - type: article
+    title: "Market Reaction Asymmetry: Infrastructure Disruption Dominance Over Regulatory Uncertainty in Cryptocurrency Markets"
+    authors:
+      - family-names: Farzulla
+        given-names: Murad
+    year: 2025
+    doi: "10.2139/ssrn.5788082"
+  - type: article
+    title: "On the relation between the expected value and the volatility of the nominal excess return on stocks"
+    authors:
+      - family-names: Glosten
+        given-names: Lawrence R.
+      - family-names: Jagannathan
+        given-names: Ravi
+      - family-names: Runkle
+        given-names: David E.
+    journal: "Journal of Finance"
+    volume: 48
+    issue: 5
+    start: 1779
+    end: 1801
+    year: 1993
