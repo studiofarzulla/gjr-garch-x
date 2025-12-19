@@ -1,7 +1,7 @@
 # gjr-garch-x
 
 [![PyPI version](https://badge.fury.io/py/gjr-garch-x.svg)](https://badge.fury.io/py/gjr-garch-x)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17917922.svg)](https://doi.org/10.5281/zenodo.17917922)
+[![DOI](https://zenodo.org/badge/1119107069.svg)](https://doi.org/10.5281/zenodo.17988193)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 
@@ -188,7 +188,8 @@ If you use this package in academic work, please cite:
   author = {Farzulla, Murad},
   title = {gjr-garch-x: GJR-GARCH Models with Exogenous Variance Regressors},
   year = {2025},
-  publisher = {PyPI},
+  publisher = {Zenodo},
+  doi = {10.5281/zenodo.17988193},
   url = {https://github.com/studiofarzulla/gjr-garch-x}
 }
 ```
