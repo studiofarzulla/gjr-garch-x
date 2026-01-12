@@ -49,7 +49,11 @@ __author__ = "Murad Farzulla"
 __email__ = "murad@farzulla.org"
 
 # Constants
-NEAR_UNIT_ROOT_THRESHOLD = 0.9999  # Threshold for persistence near 1.0
+# Threshold for detecting near-unit-root persistence in GARCH models.
+# When persistence is >= 0.9999, the half-life calculation becomes numerically
+# unstable and produces misleading negative values. This threshold prevents
+# displaying nonsensical half-life values for processes very close to non-stationary.
+NEAR_UNIT_ROOT_THRESHOLD = 0.9999
 
 __all__ = [
     "estimate_gjr_garch_x",
