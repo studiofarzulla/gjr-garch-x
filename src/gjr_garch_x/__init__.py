@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import numpy as np
 import pandas as pd
@@ -47,6 +47,13 @@ from scipy.stats import t as student_t
 __version__ = "0.1.0"
 __author__ = "Murad Farzulla"
 __email__ = "murad@farzulla.org"
+
+# Constants
+# Threshold for detecting near-unit-root persistence in GARCH models.
+# When persistence is >= 0.9999, the half-life calculation becomes numerically
+# unstable and produces misleading negative values. This threshold prevents
+# displaying nonsensical half-life values for processes very close to non-stationary.
+NEAR_UNIT_ROOT_THRESHOLD = 0.9999
 
 __all__ = [
     "estimate_gjr_garch_x",
@@ -114,7 +121,7 @@ class GJRGARCHXResults:
     iterations: int
     n_obs: int = 0
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Set n_obs from volatility length if not provided."""
         if self.n_obs == 0 and len(self.volatility) > 0:
             object.__setattr__(self, "n_obs", len(self.volatility))
@@ -166,9 +173,11 @@ class GJRGARCHXResults:
         lines.append("")
         lines.append(f"Persistence (α + β + |γ|/2): {persistence:.4f}")
 
-        if 0 < persistence < 1:
+        if 0 < persistence < NEAR_UNIT_ROOT_THRESHOLD:
             half_life = -np.log(0.5) / np.log(persistence)
             lines.append(f"Half-life of shocks:         {half_life:.1f} periods")
+        elif persistence >= NEAR_UNIT_ROOT_THRESHOLD:
+            lines.append("Half-life of shocks:         ∞ (near unit root)")
 
         # Unconditional variance (if stationary)
         omega = self.params.get("omega", 0)
@@ -281,14 +290,14 @@ class GJRGARCHXEstimator:
     def _unpack_params(self, params: np.ndarray) -> Dict[str, float]:
         """Unpack parameter vector into named dictionary."""
         param_dict = {
-            "omega": params[0],
-            "alpha": params[1],
-            "gamma": params[2],
-            "beta": params[3],
-            "nu": params[4],
+            "omega": float(params[0]),
+            "alpha": float(params[1]),
+            "gamma": float(params[2]),
+            "beta": float(params[3]),
+            "nu": float(params[4]),
         }
         for i, name in enumerate(self.exog_names):
-            param_dict[name] = params[5 + i]
+            param_dict[name] = float(params[5 + i])
         return param_dict
 
     def _variance_recursion(
@@ -312,7 +321,7 @@ class GJRGARCHXEstimator:
 
         variance = np.zeros(self.n_obs)
         mean_return = self.returns.mean()
-        residuals = (self.returns - mean_return).values
+        residuals = np.asarray((self.returns - mean_return).values)
 
         # Initialize with unconditional variance estimate
         variance[0] = np.var(self.returns)
@@ -368,7 +377,7 @@ class GJRGARCHXEstimator:
         except (ValueError, OverflowError, RuntimeWarning):
             return 1e8
 
-    def _parameter_constraints(self) -> List[Dict]:
+    def _parameter_constraints(self) -> List[Dict[str, Any]]:
         """Define optimization constraints including stationarity."""
         return [
             {"type": "ineq", "fun": lambda x: x[0] - 1e-8},  # omega > 0
@@ -394,8 +403,10 @@ class GJRGARCHXEstimator:
             5.0,  # nu
         ])
         if self.has_exog:
-            start_vals = np.append(start_vals, np.zeros(self.n_exog))
-        return start_vals
+            exog_zeros = np.zeros(self.n_exog)
+            result = np.concatenate([start_vals, exog_zeros])
+            return cast(np.ndarray, result)
+        return cast(np.ndarray, start_vals)
 
     def estimate(
         self,
@@ -425,12 +436,12 @@ class GJRGARCHXEstimator:
 
         start_vals = self._get_starting_values()
 
-        bounds = [
+        bounds: List[Tuple[Optional[float], Optional[float]]] = [
             (1e-8, None),  # omega > 0
             (1e-8, 0.3),  # alpha
             (-0.5, 0.5),  # gamma (leverage)
             (1e-8, 0.95),  # beta
-            (2.1, 50),  # nu
+            (2.1, 50.0),  # nu
         ]
         # Exogenous coefficients are unbounded
         for _ in range(self.n_exog):
@@ -533,14 +544,19 @@ class GJRGARCHXEstimator:
         try:
             hessian = self._numerical_hessian(params)
             cov_matrix = np.linalg.inv(hessian)
-            std_errs = np.sqrt(np.diag(cov_matrix))
+            diag = np.diag(cov_matrix)
+
+            # Check for negative variances before sqrt (ill-conditioned Hessian)
+            if np.any(diag < 0):
+                nan_dict = {name: np.nan for name in self.param_names}
+                return (nan_dict, nan_dict)
+
+            std_errs = np.sqrt(diag)
 
             dof = self.n_obs - self.n_params
             if dof <= 0:
-                return (
-                    {name: np.nan for name in self.param_names},
-                    {name: np.nan for name in self.param_names},
-                )
+                nan_dict = {name: np.nan for name in self.param_names}
+                return (nan_dict, nan_dict)
 
             t_stats = params / std_errs
             pvals = 2 * (1 - student_t.cdf(np.abs(t_stats), dof))
@@ -551,15 +567,13 @@ class GJRGARCHXEstimator:
             )
 
         except (np.linalg.LinAlgError, ValueError):
-            return (
-                {name: np.nan for name in self.param_names},
-                {name: np.nan for name in self.param_names},
-            )
+            nan_dict = {name: np.nan for name in self.param_names}
+            return (nan_dict, nan_dict)
 
     def _numerical_hessian(self, params: np.ndarray, h: float = 1e-5) -> np.ndarray:
         """Compute numerical Hessian via central differences."""
         n = len(params)
-        hessian = np.zeros((n, n))
+        hessian: np.ndarray = np.zeros((n, n))
 
         for i in range(n):
             for j in range(n):
