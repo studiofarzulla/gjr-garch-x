@@ -48,6 +48,9 @@ __version__ = "0.1.0"
 __author__ = "Murad Farzulla"
 __email__ = "murad@farzulla.org"
 
+# Constants
+NEAR_UNIT_ROOT_THRESHOLD = 0.9999  # Threshold for persistence near 1.0
+
 __all__ = [
     "estimate_gjr_garch_x",
     "GJRGARCHXResults",
@@ -166,10 +169,10 @@ class GJRGARCHXResults:
         lines.append("")
         lines.append(f"Persistence (α + β + |γ|/2): {persistence:.4f}")
 
-        if 0 < persistence < 0.9999:
+        if 0 < persistence < NEAR_UNIT_ROOT_THRESHOLD:
             half_life = -np.log(0.5) / np.log(persistence)
             lines.append(f"Half-life of shocks:         {half_life:.1f} periods")
-        elif persistence >= 0.9999:
+        elif persistence >= NEAR_UNIT_ROOT_THRESHOLD:
             lines.append("Half-life of shocks:         ∞ (near unit root)")
 
         # Unconditional variance (if stationary)
@@ -320,7 +323,7 @@ class GJRGARCHXEstimator:
         variance[0] = np.var(self.returns)
 
         for t in range(1, self.n_obs):
-            eps_sq_prev: float = float(residuals[t - 1] ** 2)
+            eps_sq_prev = residuals[t - 1] ** 2
             leverage_term = gamma * eps_sq_prev * (residuals[t - 1] < 0)
 
             variance[t] = (
@@ -541,19 +544,15 @@ class GJRGARCHXEstimator:
 
             # Check for negative variances before sqrt (ill-conditioned Hessian)
             if np.any(diag < 0):
-                return (
-                    {name: np.nan for name in self.param_names},
-                    {name: np.nan for name in self.param_names},
-                )
+                nan_dict = {name: np.nan for name in self.param_names}
+                return (nan_dict, nan_dict)
 
             std_errs = np.sqrt(diag)
 
             dof = self.n_obs - self.n_params
             if dof <= 0:
-                return (
-                    {name: np.nan for name in self.param_names},
-                    {name: np.nan for name in self.param_names},
-                )
+                nan_dict = {name: np.nan for name in self.param_names}
+                return (nan_dict, nan_dict)
 
             t_stats = params / std_errs
             pvals = 2 * (1 - student_t.cdf(np.abs(t_stats), dof))
@@ -564,10 +563,8 @@ class GJRGARCHXEstimator:
             )
 
         except (np.linalg.LinAlgError, ValueError):
-            return (
-                {name: np.nan for name in self.param_names},
-                {name: np.nan for name in self.param_names},
-            )
+            nan_dict = {name: np.nan for name in self.param_names}
+            return (nan_dict, nan_dict)
 
     def _numerical_hessian(self, params: np.ndarray, h: float = 1e-5) -> np.ndarray:
         """Compute numerical Hessian via central differences."""
