@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, cast
 
 import numpy as np
 import pandas as pd
@@ -114,7 +114,7 @@ class GJRGARCHXResults:
     iterations: int
     n_obs: int = 0
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Set n_obs from volatility length if not provided."""
         if self.n_obs == 0 and len(self.volatility) > 0:
             object.__setattr__(self, "n_obs", len(self.volatility))
@@ -166,9 +166,11 @@ class GJRGARCHXResults:
         lines.append("")
         lines.append(f"Persistence (α + β + |γ|/2): {persistence:.4f}")
 
-        if 0 < persistence < 1:
+        if 0 < persistence < 0.9999:
             half_life = -np.log(0.5) / np.log(persistence)
             lines.append(f"Half-life of shocks:         {half_life:.1f} periods")
+        elif persistence >= 0.9999:
+            lines.append("Half-life of shocks:         ∞ (near unit root)")
 
         # Unconditional variance (if stationary)
         omega = self.params.get("omega", 0)
@@ -281,14 +283,14 @@ class GJRGARCHXEstimator:
     def _unpack_params(self, params: np.ndarray) -> Dict[str, float]:
         """Unpack parameter vector into named dictionary."""
         param_dict = {
-            "omega": params[0],
-            "alpha": params[1],
-            "gamma": params[2],
-            "beta": params[3],
-            "nu": params[4],
+            "omega": float(params[0]),
+            "alpha": float(params[1]),
+            "gamma": float(params[2]),
+            "beta": float(params[3]),
+            "nu": float(params[4]),
         }
         for i, name in enumerate(self.exog_names):
-            param_dict[name] = params[5 + i]
+            param_dict[name] = float(params[5 + i])
         return param_dict
 
     def _variance_recursion(
@@ -312,7 +314,7 @@ class GJRGARCHXEstimator:
 
         variance = np.zeros(self.n_obs)
         mean_return = self.returns.mean()
-        residuals = (self.returns - mean_return).values
+        residuals = np.asarray((self.returns - mean_return).values)
 
         # Initialize with unconditional variance estimate
         variance[0] = np.var(self.returns)
@@ -394,8 +396,8 @@ class GJRGARCHXEstimator:
             5.0,  # nu
         ])
         if self.has_exog:
-            start_vals = np.append(start_vals, np.zeros(self.n_exog))
-        return start_vals
+            start_vals = np.asarray(np.append(start_vals, np.zeros(self.n_exog)))
+        return cast(np.ndarray, start_vals)
 
     def estimate(
         self,
@@ -434,7 +436,7 @@ class GJRGARCHXEstimator:
         ]
         # Exogenous coefficients are unbounded
         for _ in range(self.n_exog):
-            bounds.append((None, None))
+            bounds.append((-np.inf, np.inf))
 
         try:
             with warnings.catch_warnings():
@@ -533,7 +535,15 @@ class GJRGARCHXEstimator:
         try:
             hessian = self._numerical_hessian(params)
             cov_matrix = np.linalg.inv(hessian)
-            std_errs = np.sqrt(np.diag(cov_matrix))
+            diag = np.diag(cov_matrix)
+
+            if np.any(diag < 0):
+                return (
+                    {name: np.nan for name in self.param_names},
+                    {name: np.nan for name in self.param_names},
+                )
+
+            std_errs = np.sqrt(diag)
 
             dof = self.n_obs - self.n_params
             if dof <= 0:
@@ -596,7 +606,7 @@ class GJRGARCHXEstimator:
 
                     hessian[i, j] = (f_pp - f_pm - f_mp + f_mm) / (4 * h**2)
 
-        return hessian
+        return cast(np.ndarray, np.asarray(hessian))
 
 
 # Backwards compatibility alias
