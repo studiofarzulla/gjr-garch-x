@@ -100,7 +100,7 @@ Enforced automatically during estimation.
 
 ## API Reference
 
-### `estimate_gjr_garch_x(returns, exog_vars, method='SLSQP', verbose=False)`
+### `estimate_gjr_garch_x(returns, exog_vars, method='SLSQP', max_iter=1000, verbose=False)`
 
 Main estimation function.
 
@@ -108,6 +108,7 @@ Main estimation function.
 - `returns`: `pd.Series` of log returns (recommend × 100 for numerical stability)
 - `exog_vars`: `pd.DataFrame` of exogenous variables, aligned with returns index
 - `method`: Optimization method (`'SLSQP'`, `'L-BFGS-B'`, `'trust-constr'`)
+- `max_iter`: Maximum number of optimizer iterations (default: 1000)
 - `verbose`: Print estimation progress
 
 **Returns:** `GJRGARCHXResults` object
