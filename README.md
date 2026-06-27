@@ -3,7 +3,7 @@
 [![PyPI version](https://badge.fury.io/py/gjr-garch-x.svg)](https://badge.fury.io/py/gjr-garch-x)
 [![DOI](https://zenodo.org/badge/1119107069.svg)](https://doi.org/10.5281/zenodo.17988193)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
 **GJR-GARCH models with exogenous regressors in the variance equation.**
 
@@ -63,9 +63,14 @@ print(results.summary())
 
 - **Student-t innovations**: Captures fat tails in financial returns
 - **GJR-GARCH leverage effect**: Asymmetric response to positive/negative shocks
-- **Robust standard errors**: Numerical Hessian computation with proper inference
+- **Robust standard errors**: Bollerslev-Wooldridge (1992) QMLE sandwich covariance by
+  default (`cov_type="robust"`), with the classical inverse-Hessian estimator available
+  via `cov_type="hessian"`
 - **Stationarity constraints**: Enforced during optimization
-- **Pandas integration**: Works directly with Series/DataFrame objects
+- **Configurable coefficient caps**: `alpha_max` / `beta_max` (relaxed defaults so the
+  bounds do not silently bind on high-volatility daily series such as crypto)
+- **Pandas integration**: Works directly with Series/DataFrame objects, with array-like
+  coercion and informative alignment errors
 - **No dependencies on `arch`**: Standalone implementation
 - **Type hints**: Full type annotations for IDE support
 
@@ -98,17 +103,66 @@ print(results.summary())
 
 Enforced automatically during estimation.
 
+### Coefficient bounds
+
+The individual ARCH/GARCH bounds are exposed as keyword arguments and default to loose
+values so that they do not silently bind:
+
+| Argument | Default | Note |
+|----------|---------|------|
+| `alpha_max` | `0.99` | Upper bound on `α` (was a hard-coded `0.30` before v0.2.0) |
+| `beta_max` | `0.999` | Upper bound on `β` (was a hard-coded `0.95` before v0.2.0) |
+
+The economically meaningful restriction is the stationarity constraint
+`α + β + |γ|/2 < 1`, which is always enforced regardless of these caps. Tighten the caps
+explicitly (e.g. `alpha_max=0.30`) if you want the historical behaviour.
+
+## Standard Errors and Inference
+
+Coefficients are estimated by quasi-maximum likelihood (QMLE) with Student-t innovations.
+Two covariance estimators are available via `cov_type`:
+
+- **`cov_type="robust"` (default)** — the Bollerslev-Wooldridge (1992) QMLE sandwich
+  covariance
+
+  ```
+  V = H⁻¹ · OPG · H⁻¹
+  ```
+
+  where `H` is the observed information (Hessian of the negative log-likelihood) and
+  `OPG = Σ_t sₜ sₜᵀ` is the outer product of the per-observation score contributions.
+  These standard errors remain valid when the Student-t likelihood is misspecified (the
+  usual QMLE robustness), which is the relevant case for heavy-tailed asset returns.
+
+- **`cov_type="hessian"`** — the classical inverse observed-information covariance `H⁻¹`,
+  valid only under correct specification.
+
+The Hessian is symmetrised and checked for positive definiteness; if it is not positive
+definite (a near-degenerate fit), the covariance falls back to the Moore-Penrose
+pseudo-inverse and a `RuntimeWarning` is emitted rather than returning silent `NaN`s.
+
+```python
+robust = estimate_gjr_garch_x(returns, exog_vars)                    # BW sandwich (default)
+classical = estimate_gjr_garch_x(returns, exog_vars, cov_type="hessian")
+print(robust.cov_type, classical.cov_type)  # 'robust' 'hessian'
+```
+
 ## API Reference
 
-### `estimate_gjr_garch_x(returns, exog_vars, method='SLSQP', verbose=False)`
+### `estimate_gjr_garch_x(returns, exog_vars=None, method='SLSQP', max_iter=1000, verbose=False, cov_type='robust', alpha_max=0.99, beta_max=0.999)`
 
 Main estimation function.
 
 **Parameters:**
-- `returns`: `pd.Series` of log returns (recommend × 100 for numerical stability)
-- `exog_vars`: `pd.DataFrame` of exogenous variables, aligned with returns index
+- `returns`: returns series (recommend log returns × 100). Accepts a `pd.Series`
+  (index preserved), a single-column DataFrame, or any 1-D array-like; NaNs are dropped
+- `exog_vars`: `pd.DataFrame` (index must cover the returns index) or a bare array matching
+  the number of returns observations; exogenous variables for the variance equation
 - `method`: Optimization method (`'SLSQP'`, `'L-BFGS-B'`, `'trust-constr'`)
+- `max_iter`: Maximum optimizer iterations
 - `verbose`: Print estimation progress
+- `cov_type`: `'robust'` (Bollerslev-Wooldridge sandwich, default) or `'hessian'`
+- `alpha_max`, `beta_max`: Upper bounds on `α` and `β` (see *Coefficient bounds*)
 
 **Returns:** `GJRGARCHXResults` object
 
@@ -117,8 +171,9 @@ Main estimation function.
 Results container with attributes:
 - `converged`: `bool` — Did optimization converge?
 - `params`: `Dict[str, float]` — All parameter estimates
-- `std_errors`: `Dict[str, float]` — Standard errors
+- `std_errors`: `Dict[str, float]` — Standard errors (per `cov_type`)
 - `pvalues`: `Dict[str, float]` — Two-sided p-values
+- `cov_type`: `str` — Covariance estimator used (`'robust'` or `'hessian'`)
 - `log_likelihood`: `float`
 - `aic`, `bic`: `float` — Information criteria
 - `volatility`: `pd.Series` — Conditional standard deviation σ_t

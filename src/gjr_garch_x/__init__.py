@@ -21,6 +21,18 @@ Leverage Effect Interpretation:
     - For negative shocks (ε_{t-1} < 0): volatility impact = α + γ
     - If γ > 0: negative returns increase volatility MORE than positive returns
 
+Inference:
+    Coefficients are estimated by quasi-maximum likelihood (QMLE) with Student-t
+    innovations. Two covariance estimators are provided:
+
+    - ``cov_type="robust"`` (default): the Bollerslev-Wooldridge (1992) QMLE
+      sandwich covariance H⁻¹ · OPG · H⁻¹, where H is the observed information
+      (Hessian of the negative log-likelihood) and OPG is the outer product of
+      the per-observation score contributions. These standard errors remain valid
+      under distributional misspecification of the innovations.
+    - ``cov_type="hessian"``: the classical inverse-Hessian (observed-information)
+      covariance, valid only when the likelihood is correctly specified.
+
 References:
     Glosten, Jagannathan & Runkle (1993). On the relation between expected
         value and volatility of nominal excess return on stocks.
@@ -36,15 +48,14 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
-from scipy.special import gamma as gamma_func
+from scipy.special import gammaln
 from scipy.stats import t as student_t
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __author__ = "Murad Farzulla"
 __email__ = "murad@farzulla.org"
 
@@ -68,11 +79,11 @@ class GJRGARCHXResults:
     ----------
     converged : bool
         Whether optimization converged successfully.
-    params : Dict[str, float]
+    params : dict[str, float]
         All parameter estimates including GARCH and exogenous coefficients.
-    std_errors : Dict[str, float]
-        Standard errors computed from numerical Hessian.
-    pvalues : Dict[str, float]
+    std_errors : dict[str, float]
+        Standard errors for each parameter (see ``cov_type``).
+    pvalues : dict[str, float]
         Two-sided p-values for parameter significance.
     log_likelihood : float
         Maximized log-likelihood value.
@@ -84,11 +95,11 @@ class GJRGARCHXResults:
         Conditional standard deviation series σ_t.
     residuals : pd.Series
         Demeaned residuals ε_t.
-    exog_effects : Dict[str, float]
+    exog_effects : dict[str, float]
         Coefficients on all exogenous variables.
-    event_effects : Dict[str, float]
+    event_effects : dict[str, float]
         Coefficients on event-type exogenous variables (detected by keywords).
-    sentiment_effects : Dict[str, float]
+    sentiment_effects : dict[str, float]
         Coefficients on sentiment-type variables (detected by keywords).
     leverage_effect : float
         The γ parameter capturing asymmetric volatility response.
@@ -96,25 +107,30 @@ class GJRGARCHXResults:
         Number of optimizer iterations.
     n_obs : int
         Number of observations used in estimation.
+    cov_type : str
+        Covariance estimator used for ``std_errors``: ``"robust"``
+        (Bollerslev-Wooldridge QMLE sandwich) or ``"hessian"``
+        (inverse observed information).
     """
 
     converged: bool
-    params: Dict[str, float]
-    std_errors: Dict[str, float]
-    pvalues: Dict[str, float]
+    params: dict[str, float]
+    std_errors: dict[str, float]
+    pvalues: dict[str, float]
     log_likelihood: float
     aic: float
     bic: float
     volatility: pd.Series
     residuals: pd.Series
-    exog_effects: Dict[str, float]
-    event_effects: Dict[str, float]
-    sentiment_effects: Dict[str, float]
+    exog_effects: dict[str, float]
+    event_effects: dict[str, float]
+    sentiment_effects: dict[str, float]
     leverage_effect: float
     iterations: int
     n_obs: int = 0
+    cov_type: str = "robust"
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Set n_obs from volatility length if not provided."""
         if self.n_obs == 0 and len(self.volatility) > 0:
             object.__setattr__(self, "n_obs", len(self.volatility))
@@ -128,6 +144,11 @@ class GJRGARCHXResults:
         str
             Multi-line summary string suitable for printing.
         """
+        se_label = {
+            "robust": "robust (Bollerslev-Wooldridge QMLE sandwich)",
+            "hessian": "inverse Hessian (observed information)",
+        }.get(self.cov_type, self.cov_type)
+
         lines = [
             "",
             "=" * 65,
@@ -138,6 +159,7 @@ class GJRGARCHXResults:
             f"AIC:             {self.aic:.4f}",
             f"BIC:             {self.bic:.4f}",
             f"Observations:    {self.n_obs}",
+            f"Std. errors:     {se_label}",
             "",
             "Variance Equation Parameters:",
             "-" * 45,
@@ -186,9 +208,7 @@ class GJRGARCHXResults:
                 se = self.std_errors.get(name, np.nan)
                 pval = self.pvalues.get(name, np.nan)
                 sig = _significance_stars(pval)
-                lines.append(
-                    f"{name:<25} {coef:>+10.6f} ({se:.4f}) [{pval:.4f}]{sig}"
-                )
+                lines.append(f"{name:<25} {coef:>+10.6f} ({se:.4f}) [{pval:.4f}]{sig}")
 
         if self.sentiment_effects:
             lines.append("")
@@ -198,9 +218,7 @@ class GJRGARCHXResults:
                 se = self.std_errors.get(name, np.nan)
                 pval = self.pvalues.get(name, np.nan)
                 sig = _significance_stars(pval)
-                lines.append(
-                    f"{name:<25} {coef:>+10.6f} ({se:.4f}) [{pval:.4f}]{sig}"
-                )
+                lines.append(f"{name:<25} {coef:>+10.6f} ({se:.4f}) [{pval:.4f}]{sig}")
 
         lines.append("")
         lines.append("=" * 65)
@@ -213,7 +231,7 @@ class GJRGARCHXResults:
         return (
             f"GJRGARCHXResults(converged={self.converged}, "
             f"aic={self.aic:.2f}, bic={self.bic:.2f}, "
-            f"n_obs={self.n_obs}, n_exog={n_exog})"
+            f"n_obs={self.n_obs}, n_exog={n_exog}, cov_type={self.cov_type!r})"
         )
 
 
@@ -234,6 +252,27 @@ def _significance_stars(pval: float) -> str:
     return ""
 
 
+def _as_series(returns: object) -> pd.Series:
+    """Coerce array-like returns into a float pd.Series with informative errors."""
+    if isinstance(returns, pd.Series):
+        series = returns.astype(float)
+    elif isinstance(returns, pd.DataFrame):
+        if returns.shape[1] != 1:
+            raise ValueError(
+                "returns must be one-dimensional; got a DataFrame with "
+                f"{returns.shape[1]} columns. Pass a single Series/column."
+            )
+        series = returns.iloc[:, 0].astype(float)
+    else:
+        arr = np.asarray(returns, dtype=float)
+        if arr.ndim != 1:
+            raise ValueError(
+                f"returns must be one-dimensional; got array with shape {arr.shape}."
+            )
+        series = pd.Series(arr)
+    return series
+
+
 class GJRGARCHXEstimator:
     """
     GJR-GARCH-X model estimator with exogenous variance regressors.
@@ -243,11 +282,14 @@ class GJRGARCHXEstimator:
 
     Parameters
     ----------
-    returns : pd.Series
-        Series of returns (recommend log returns × 100 for numerical stability).
-    exog_vars : pd.DataFrame, optional
-        DataFrame of exogenous variables for the variance equation.
-        Index must align with returns.
+    returns : array-like
+        Returns series (recommend log returns × 100 for numerical stability).
+        Accepts a ``pd.Series`` (index preserved), a single-column DataFrame, or
+        any 1-D array-like (a default integer index is assigned). NaNs are dropped.
+    exog_vars : pd.DataFrame or array-like, optional
+        Exogenous variables for the variance equation. A DataFrame index must
+        cover the returns index; a bare array must match the number of returns
+        observations (before NaN-dropping) and is assigned generic column names.
 
     Examples
     --------
@@ -259,26 +301,68 @@ class GJRGARCHXEstimator:
     def __init__(
         self,
         returns: pd.Series,
-        exog_vars: Optional[pd.DataFrame] = None,
+        exog_vars: pd.DataFrame | None = None,
     ):
-        self.returns = returns.dropna()
+        returns = _as_series(returns)
+        raw_index = returns.index
+        self.returns: pd.Series = returns.dropna()
 
+        if len(self.returns) == 0:
+            raise ValueError("returns contains no non-NaN observations.")
+
+        self.exog_vars: pd.DataFrame | None
         if exog_vars is not None:
-            self.exog_vars = exog_vars.loc[self.returns.index].fillna(0)
+            exog_df = self._coerce_exog(exog_vars, raw_index)
+            missing = self.returns.index.difference(exog_df.index)
+            if len(missing) > 0:
+                raise ValueError(
+                    "exog_vars index does not cover all returns observations: "
+                    f"{len(missing)} returns timestamps are missing from exog_vars "
+                    f"(e.g. {list(missing[:3])}). Align exog_vars to the returns index."
+                )
+            self.exog_vars = exog_df.loc[self.returns.index].fillna(0.0)
             self.has_exog = True
             self.n_exog = self.exog_vars.shape[1]
             self.exog_names = list(self.exog_vars.columns)
+            self._exog_array = self.exog_vars.to_numpy(dtype=float)
         else:
             self.exog_vars = None
             self.has_exog = False
             self.n_exog = 0
             self.exog_names = []
+            self._exog_array = np.empty((len(self.returns), 0), dtype=float)
 
         self.n_obs = len(self.returns)
         self.param_names = ["omega", "alpha", "gamma", "beta", "nu"] + self.exog_names
         self.n_params = 5 + self.n_exog
 
-    def _unpack_params(self, params: np.ndarray) -> Dict[str, float]:
+    @staticmethod
+    def _coerce_exog(exog_vars: object, raw_index: pd.Index) -> pd.DataFrame:
+        """Coerce exogenous regressors into an index-aligned float DataFrame."""
+        if isinstance(exog_vars, pd.DataFrame):
+            df: pd.DataFrame = exog_vars.astype(float)
+            return df
+        if isinstance(exog_vars, pd.Series):
+            frame: pd.DataFrame = exog_vars.astype(float).to_frame()
+            return frame
+
+        arr = np.asarray(exog_vars, dtype=float)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        if arr.ndim != 2:
+            raise ValueError(
+                f"exog_vars must be 1-D or 2-D; got array with shape {arr.shape}."
+            )
+        if arr.shape[0] != len(raw_index):
+            raise ValueError(
+                f"exog_vars has {arr.shape[0]} rows but returns has {len(raw_index)} "
+                "observations; row counts must match for a bare array. Pass a "
+                "DataFrame with an aligned index if they differ."
+            )
+        cols = [f"x{i}" for i in range(arr.shape[1])]
+        return pd.DataFrame(arr, index=raw_index, columns=cols)
+
+    def _unpack_params(self, params: np.ndarray) -> dict[str, float]:
         """Unpack parameter vector into named dictionary."""
         param_dict = {
             "omega": params[0],
@@ -291,9 +375,7 @@ class GJRGARCHXEstimator:
             param_dict[name] = params[5 + i]
         return param_dict
 
-    def _variance_recursion(
-        self, params: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    def _variance_recursion(self, params: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
         Compute conditional variance via GARCH recursion.
 
@@ -304,71 +386,70 @@ class GJRGARCHXEstimator:
         residuals : np.ndarray
             Demeaned residuals ε_t.
         """
-        param_dict = self._unpack_params(params)
-        omega = param_dict["omega"]
-        alpha = param_dict["alpha"]
-        gamma = param_dict["gamma"]
-        beta = param_dict["beta"]
+        omega = params[0]
+        alpha = params[1]
+        gamma = params[2]
+        beta = params[3]
+        deltas = params[5:]
 
         variance = np.zeros(self.n_obs)
-        mean_return = self.returns.mean()
-        residuals = (self.returns - mean_return).values
+        returns_arr = self.returns.to_numpy(dtype=float)
+        mean_return = float(returns_arr.mean())
+        residuals = returns_arr - mean_return
 
         # Initialize with unconditional variance estimate
-        variance[0] = np.var(self.returns)
+        variance[0] = float(np.var(returns_arr))
 
         for t in range(1, self.n_obs):
             eps_sq_prev = residuals[t - 1] ** 2
             leverage_term = gamma * eps_sq_prev * (residuals[t - 1] < 0)
 
-            variance[t] = (
-                omega
-                + alpha * eps_sq_prev
-                + leverage_term
-                + beta * variance[t - 1]
-            )
+            v = omega + alpha * eps_sq_prev + leverage_term + beta * variance[t - 1]
 
-            # Add exogenous effects
             if self.has_exog:
-                for i, exog_name in enumerate(self.exog_names):
-                    delta = param_dict[exog_name]
-                    exog_value = self.exog_vars.iloc[t, i]
-                    variance[t] += delta * exog_value
+                v += float(self._exog_array[t] @ deltas)
 
             # Ensure positive variance
-            variance[t] = max(variance[t], 1e-8)
+            variance[t] = v if v > 1e-8 else 1e-8
 
         return variance, residuals
+
+    def _loglik_contributions(self, params: np.ndarray) -> np.ndarray:
+        """
+        Per-observation log-likelihood contributions (Student-t GJR-GARCH-X).
+
+        Returns one log-density value per observation. The constant
+        (parameter-only) log-gamma normalising term is computed once and
+        broadcast, rather than recomputed inside a per-observation loop.
+        """
+        nu = params[4]
+
+        variance, residuals = self._variance_recursion(params)
+        std_residuals = residuals / np.sqrt(variance)
+
+        # Constant Student-t normalising term (depends on nu only, not on t).
+        log_const = (
+            gammaln((nu + 1) / 2) - gammaln(nu / 2) - 0.5 * np.log(np.pi * (nu - 2))
+        )
+
+        contributions = (
+            log_const
+            - 0.5 * np.log(variance)
+            - ((nu + 1) / 2) * np.log(1.0 + std_residuals**2 / (nu - 2))
+        )
+        return contributions
 
     def _log_likelihood(self, params: np.ndarray) -> float:
         """Compute negative log-likelihood for Student-t GJR-GARCH-X."""
         try:
-            param_dict = self._unpack_params(params)
-            nu = param_dict["nu"]
-
-            variance, residuals = self._variance_recursion(params)
-            std_residuals = residuals / np.sqrt(variance)
-
-            # Student-t log-likelihood
-            log_lik = 0.0
-            for t in range(self.n_obs):
-                log_gamma_term = (
-                    np.log(gamma_func((nu + 1) / 2))
-                    - np.log(gamma_func(nu / 2))
-                    - 0.5 * np.log(np.pi * (nu - 2))
-                )
-                log_var_term = -0.5 * np.log(variance[t])
-                density_term = -((nu + 1) / 2) * np.log(
-                    1 + std_residuals[t] ** 2 / (nu - 2)
-                )
-                log_lik += log_gamma_term + log_var_term + density_term
-
-            return -log_lik
-
-        except (ValueError, OverflowError, RuntimeWarning):
+            total = float(np.sum(self._loglik_contributions(params)))
+            if not np.isfinite(total):
+                return 1e8
+            return -total
+        except (ValueError, OverflowError, RuntimeWarning, FloatingPointError):
             return 1e8
 
-    def _parameter_constraints(self) -> List[Dict]:
+    def _parameter_constraints(self) -> list[dict]:
         """Define optimization constraints including stationarity."""
         return [
             {"type": "ineq", "fun": lambda x: x[0] - 1e-8},  # omega > 0
@@ -386,13 +467,15 @@ class GJRGARCHXEstimator:
     def _get_starting_values(self) -> np.ndarray:
         """Generate reasonable starting values."""
         sample_var = np.var(self.returns)
-        start_vals = np.array([
-            sample_var * 0.1,  # omega
-            0.05,  # alpha
-            0.05,  # gamma (leverage)
-            0.85,  # beta
-            5.0,  # nu
-        ])
+        start_vals = np.array(
+            [
+                sample_var * 0.1,  # omega
+                0.05,  # alpha
+                0.05,  # gamma (leverage)
+                0.85,  # beta
+                5.0,  # nu
+            ]
+        )
         if self.has_exog:
             start_vals = np.append(start_vals, np.zeros(self.n_exog))
         return start_vals
@@ -402,6 +485,9 @@ class GJRGARCHXEstimator:
         method: str = "SLSQP",
         max_iter: int = 1000,
         verbose: bool = False,
+        cov_type: str = "robust",
+        alpha_max: float = 0.99,
+        beta_max: float = 0.999,
     ) -> GJRGARCHXResults:
         """
         Estimate GJR-GARCH-X model via maximum likelihood.
@@ -414,22 +500,43 @@ class GJRGARCHXEstimator:
             Maximum number of optimizer iterations.
         verbose : bool, default False
             Print estimation progress.
+        cov_type : {"robust", "hessian"}, default "robust"
+            Standard-error estimator. ``"robust"`` uses the Bollerslev-Wooldridge
+            (1992) QMLE sandwich H⁻¹·OPG·H⁻¹; ``"hessian"`` uses the classical
+            inverse observed information.
+        alpha_max : float, default 0.99
+            Upper bound on the ARCH coefficient α. Relaxed from the historical
+            hard cap of 0.3, which silently bound on high-volatility daily series
+            (e.g. crypto). The economically meaningful restriction is the
+            stationarity constraint α + β + |γ|/2 < 1, which is always enforced.
+        beta_max : float, default 0.999
+            Upper bound on the GARCH coefficient β. Relaxed from the historical
+            hard cap of 0.95 for the same reason as ``alpha_max``.
 
         Returns
         -------
         GJRGARCHXResults
             Estimation results container.
         """
+        if cov_type not in ("robust", "hessian"):
+            raise ValueError(
+                f"cov_type must be 'robust' or 'hessian', got {cov_type!r}."
+            )
+        if not 0 < alpha_max <= 1:
+            raise ValueError(f"alpha_max must be in (0, 1], got {alpha_max}.")
+        if not 0 < beta_max < 1:
+            raise ValueError(f"beta_max must be in (0, 1), got {beta_max}.")
+
         if verbose:
             print(f"Estimating GJR-GARCH-X with {self.n_exog} exogenous variables...")
 
         start_vals = self._get_starting_values()
 
-        bounds = [
+        bounds: list[tuple[float | None, float | None]] = [
             (1e-8, None),  # omega > 0
-            (1e-8, 0.3),  # alpha
+            (1e-8, alpha_max),  # alpha
             (-0.5, 0.5),  # gamma (leverage)
-            (1e-8, 0.95),  # beta
+            (1e-8, beta_max),  # beta
             (2.1, 50),  # nu
         ]
         # Exogenous coefficients are unbounded
@@ -457,7 +564,9 @@ class GJRGARCHXEstimator:
             volatility = pd.Series(np.sqrt(variance), index=self.returns.index)
             residuals_series = pd.Series(residuals, index=self.returns.index)
 
-            std_errors, pvalues = self._compute_standard_errors(optimal_params)
+            std_errors, pvalues = self._compute_standard_errors(
+                optimal_params, cov_type=cov_type
+            )
 
             log_lik = -result.fun
             aic = 2 * self.n_params - 2 * log_lik
@@ -469,7 +578,6 @@ class GJRGARCHXEstimator:
             sentiment_effects = {}
 
             sentiment_keywords = {"sentiment", "gdelt", "tone", "mood", "fear", "greed"}
-            event_keywords = {"event", "dummy", "d_", "infra", "reg", "shock"}
 
             for name in self.exog_names:
                 name_lower = name.lower()
@@ -485,6 +593,7 @@ class GJRGARCHXEstimator:
                 print(f"  [{status}] Iterations: {result.nit}")
                 print(f"  Log-likelihood: {log_lik:.2f}")
                 print(f"  AIC: {aic:.2f}, BIC: {bic:.2f}")
+                print(f"  Std. errors: {cov_type}")
 
             return GJRGARCHXResults(
                 converged=converged,
@@ -502,6 +611,7 @@ class GJRGARCHXEstimator:
                 leverage_effect=param_dict["gamma"],
                 iterations=result.nit,
                 n_obs=self.n_obs,
+                cov_type=cov_type,
             )
 
         except Exception as e:
@@ -524,40 +634,130 @@ class GJRGARCHXEstimator:
                 leverage_effect=np.nan,
                 iterations=0,
                 n_obs=0,
+                cov_type=cov_type,
             )
 
     def _compute_standard_errors(
-        self, params: np.ndarray
-    ) -> Tuple[Dict[str, float], Dict[str, float]]:
-        """Compute standard errors via numerical Hessian."""
+        self, params: np.ndarray, cov_type: str = "robust"
+    ) -> tuple[dict[str, float], dict[str, float]]:
+        """
+        Compute standard errors and two-sided p-values.
+
+        Parameters
+        ----------
+        params : np.ndarray
+            Estimated parameter vector.
+        cov_type : {"robust", "hessian"}
+            ``"robust"`` returns Bollerslev-Wooldridge QMLE sandwich SEs;
+            ``"hessian"`` returns inverse-observed-information SEs.
+        """
+        nan_dict = dict.fromkeys(self.param_names, np.nan)
         try:
-            hessian = self._numerical_hessian(params)
-            cov_matrix = np.linalg.inv(hessian)
-            std_errs = np.sqrt(np.diag(cov_matrix))
+            cov_matrix = self._covariance_matrix(params, cov_type=cov_type)
 
             dof = self.n_obs - self.n_params
             if dof <= 0:
-                return (
-                    {name: np.nan for name in self.param_names},
-                    {name: np.nan for name in self.param_names},
-                )
+                return nan_dict, dict(nan_dict)
 
-            t_stats = params / std_errs
+            # Guard the sqrt against non-positive variances (e.g. when a
+            # non-positive-definite Hessian leaks through the pseudo-inverse).
+            var_params = np.diag(cov_matrix)
+            std_errs = np.full(self.n_params, np.nan)
+            positive = var_params > 0
+            std_errs[positive] = np.sqrt(var_params[positive])
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                t_stats = params / std_errs
             pvals = 2 * (1 - student_t.cdf(np.abs(t_stats), dof))
 
             return (
-                dict(zip(self.param_names, std_errs)),
-                dict(zip(self.param_names, pvals)),
+                dict(zip(self.param_names, std_errs, strict=True)),
+                dict(zip(self.param_names, pvals, strict=True)),
             )
 
         except (np.linalg.LinAlgError, ValueError):
-            return (
-                {name: np.nan for name in self.param_names},
-                {name: np.nan for name in self.param_names},
+            return nan_dict, dict(nan_dict)
+
+    def _covariance_matrix(
+        self, params: np.ndarray, cov_type: str = "robust"
+    ) -> np.ndarray:
+        """
+        Parameter covariance matrix.
+
+        Builds the observed information A = Hessian of the negative log-likelihood
+        and inverts it (the inverse-Hessian / "hessian" covariance). For the
+        Bollerslev-Wooldridge robust covariance, it additionally forms the outer
+        product of gradients B = Σ_t s_t s_tᵀ from the per-observation scores and
+        returns the QMLE sandwich A⁻¹ B A⁻¹.
+
+        The Hessian is symmetrised and tested for positive definiteness; if it is
+        not positive definite (or is singular), a pseudo-inverse is used and a
+        ``RuntimeWarning`` is emitted, so a degenerate fit degrades gracefully
+        rather than raising.
+        """
+        hessian = self._numerical_hessian(params)
+        # Symmetrise: finite-difference Hessians are only symmetric up to noise.
+        hessian = 0.5 * (hessian + hessian.T)
+
+        min_eig = float(np.linalg.eigvalsh(hessian).min())
+        if min_eig <= 0:
+            warnings.warn(
+                "Observed-information matrix is not positive definite "
+                f"(min eigenvalue {min_eig:.3e}); falling back to the "
+                "Moore-Penrose pseudo-inverse for the covariance. Standard "
+                "errors for near-degenerate parameters may be unreliable.",
+                RuntimeWarning,
+                stacklevel=2,
             )
+            a_inv = np.linalg.pinv(hessian)
+        else:
+            a_inv = np.linalg.inv(hessian)
+
+        if cov_type == "hessian":
+            return a_inv
+
+        # Robust (Bollerslev-Wooldridge) sandwich: A^-1 B A^-1.
+        scores = self._score_contributions(params)
+        opg = scores.T @ scores
+        sandwich = a_inv @ opg @ a_inv
+        if not np.all(np.isfinite(sandwich)):
+            warnings.warn(
+                "Robust (sandwich) covariance contains non-finite entries; "
+                "falling back to inverse-Hessian standard errors.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return a_inv
+        return sandwich
+
+    def _score_contributions(self, params: np.ndarray, h: float = 1e-5) -> np.ndarray:
+        """
+        Per-observation score matrix G (n_obs × n_params).
+
+        Column k is the central-difference derivative of the per-observation
+        log-likelihood contributions with respect to parameter k. The outer
+        product Gᵀ·G is the OPG (information-matrix) estimator used by the
+        Bollerslev-Wooldridge sandwich.
+        """
+        n = len(params)
+        scores = np.zeros((self.n_obs, n))
+        steps = h * np.maximum(np.abs(params), 1.0)
+
+        for k in range(n):
+            params_plus = params.copy()
+            params_minus = params.copy()
+            params_plus[k] += steps[k]
+            params_minus[k] -= steps[k]
+
+            contrib_plus = self._loglik_contributions(params_plus)
+            contrib_minus = self._loglik_contributions(params_minus)
+            scores[:, k] = (contrib_plus - contrib_minus) / (2 * steps[k])
+
+        # Guard against the rare non-finite contribution at a perturbed point.
+        return np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _numerical_hessian(self, params: np.ndarray, h: float = 1e-5) -> np.ndarray:
-        """Compute numerical Hessian via central differences."""
+        """Compute numerical Hessian of the negative log-likelihood (central diff)."""
         n = len(params)
         hessian = np.zeros((n, n))
 
@@ -605,10 +805,13 @@ TARCHXEstimator = GJRGARCHXEstimator
 
 def estimate_gjr_garch_x(
     returns: pd.Series,
-    exog_vars: Optional[pd.DataFrame] = None,
+    exog_vars: pd.DataFrame | None = None,
     method: str = "SLSQP",
     max_iter: int = 1000,
     verbose: bool = False,
+    cov_type: str = "robust",
+    alpha_max: float = 0.99,
+    beta_max: float = 0.999,
 ) -> GJRGARCHXResults:
     """
     Estimate GJR-GARCH-X model with exogenous variance regressors.
@@ -618,17 +821,26 @@ def estimate_gjr_garch_x(
 
     Parameters
     ----------
-    returns : pd.Series
-        Series of returns. Recommend log returns × 100 for numerical stability.
-    exog_vars : pd.DataFrame, optional
-        DataFrame of exogenous variables for the variance equation.
-        Index must align with returns. Columns become variance regressors.
+    returns : array-like
+        Returns series. Recommend log returns × 100 for numerical stability.
+        Accepts a ``pd.Series``, a single-column DataFrame, or any 1-D array-like.
+    exog_vars : pd.DataFrame or array-like, optional
+        Exogenous variables for the variance equation. A DataFrame index must
+        cover the returns index; a bare array must match the number of returns.
     method : str, default "SLSQP"
         Optimization method. Recommended: "SLSQP" or "L-BFGS-B".
     max_iter : int, default 1000
         Maximum optimizer iterations.
     verbose : bool, default False
         Print estimation progress to stdout.
+    cov_type : {"robust", "hessian"}, default "robust"
+        Standard-error estimator. ``"robust"`` returns Bollerslev-Wooldridge
+        (1992) QMLE sandwich standard errors; ``"hessian"`` returns the classical
+        inverse-observed-information standard errors.
+    alpha_max : float, default 0.99
+        Upper bound on the ARCH coefficient α (see :meth:`GJRGARCHXEstimator.estimate`).
+    beta_max : float, default 0.999
+        Upper bound on the GARCH coefficient β.
 
     Returns
     -------
@@ -649,6 +861,10 @@ def estimate_gjr_garch_x(
     >>> results = estimate_gjr_garch_x(returns, exog)
     >>> print(f"Event effect: {results.event_effects['D_event']:.4f}")
 
+    Classical inverse-Hessian standard errors instead of the robust default:
+
+    >>> results = estimate_gjr_garch_x(returns, cov_type="hessian")
+
     Notes
     -----
     The model specification is:
@@ -662,9 +878,20 @@ def estimate_gjr_garch_x(
     Glosten, L. R., Jagannathan, R., & Runkle, D. E. (1993). On the relation
     between the expected value and the volatility of the nominal excess return
     on stocks. Journal of Finance, 48(5), 1779-1801.
+
+    Bollerslev, T., & Wooldridge, J. M. (1992). Quasi-maximum likelihood
+    estimation and inference in dynamic models with time-varying covariances.
+    Econometric Reviews, 11(2), 143-172.
     """
     estimator = GJRGARCHXEstimator(returns, exog_vars)
-    return estimator.estimate(method=method, max_iter=max_iter, verbose=verbose)
+    return estimator.estimate(
+        method=method,
+        max_iter=max_iter,
+        verbose=verbose,
+        cov_type=cov_type,
+        alpha_max=alpha_max,
+        beta_max=beta_max,
+    )
 
 
 # Backwards compatibility alias

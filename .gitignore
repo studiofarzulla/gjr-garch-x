@@ -14,6 +14,15 @@ __pycache__/
 .pytest_cache/
 htmlcov/
 
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+.venv*/
+venv/
+
 # IDE
 .vscode/
 .idea/

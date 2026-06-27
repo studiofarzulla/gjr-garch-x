@@ -7,13 +7,13 @@ import pandas as pd
 import pytest
 
 from gjr_garch_x import (
-    estimate_gjr_garch_x,
     GJRGARCHXEstimator,
     GJRGARCHXResults,
-    # Backwards compatibility
-    estimate_tarch_x,
     TARCHXEstimator,
     TARCHXResults,
+    estimate_gjr_garch_x,
+    # Backwards compatibility
+    estimate_tarch_x,
 )
 
 
@@ -235,7 +235,7 @@ class TestBackwardsCompatibility:
         results_tarch = estimate_tarch_x(returns)
 
         # Same function, same results (with same seed)
-        assert type(results_gjr) == type(results_tarch)
+        assert type(results_gjr) is type(results_tarch)
 
     def test_tarch_alias_class(self):
         """TARCHXEstimator should be alias for GJRGARCHXEstimator."""
@@ -257,6 +257,154 @@ class TestVerboseMode:
         captured = capsys.readouterr()
         assert "Estimating GJR-GARCH-X" in captured.out
         assert results.converged
+
+
+class TestStandardErrors:
+    """Test the robust (Bollerslev-Wooldridge) and Hessian covariance estimators."""
+
+    def test_robust_is_default(self):
+        """Robust SEs should be the default covariance type."""
+        returns = generate_garch_data(500)
+        results = estimate_gjr_garch_x(returns)
+        assert results.cov_type == "robust"
+
+    def test_robust_ses_finite_and_positive(self):
+        """Robust standard errors should be computed (finite and positive)."""
+        returns = generate_garch_data(500)
+        results = estimate_gjr_garch_x(returns, cov_type="robust")
+
+        for param in ["omega", "alpha", "gamma", "beta", "nu"]:
+            se = results.std_errors[param]
+            assert np.isfinite(se), f"{param} robust SE is not finite"
+            assert se > 0, f"{param} robust SE is not positive"
+
+    def test_hessian_cov_type_available(self):
+        """The classical inverse-Hessian SEs should remain available."""
+        returns = generate_garch_data(500)
+        results = estimate_gjr_garch_x(returns, cov_type="hessian")
+        assert results.cov_type == "hessian"
+        for param in ["omega", "alpha", "beta"]:
+            assert np.isfinite(results.std_errors[param])
+
+    def test_robust_differs_from_hessian(self):
+        """
+        The QMLE sandwich must actually differ from the inverse-Hessian SEs.
+
+        Under the Bollerslev-Wooldridge sandwich H^-1 . OPG . H^-1, the OPG block
+        is not equal to the Hessian unless the likelihood is exactly correctly
+        specified, so the two SE vectors should be sensibly (not trivially)
+        different on real-ish data.
+        """
+        returns = generate_garch_data(600)
+        exog = pd.DataFrame(index=returns.index)
+        exog["D_event"] = 0.0
+        exog.iloc[100:140, 0] = 1.0
+
+        res_h = estimate_gjr_garch_x(returns, exog, cov_type="hessian")
+        res_r = estimate_gjr_garch_x(returns, exog, cov_type="robust")
+
+        hessian_ses = np.array([res_h.std_errors[p] for p in res_h.params])
+        robust_ses = np.array([res_r.std_errors[p] for p in res_r.params])
+
+        # Both vectors are well-defined ...
+        assert np.all(np.isfinite(robust_ses)) and np.all(robust_ses > 0)
+        # ... but not identical: the sandwich is doing real work.
+        assert not np.allclose(robust_ses, hessian_ses, rtol=1e-2)
+        # At least one parameter's SE should shift by a non-trivial margin.
+        rel_diff = np.abs(robust_ses - hessian_ses) / hessian_ses
+        assert rel_diff.max() > 0.05
+
+    def test_invalid_cov_type_raises(self):
+        """An unknown cov_type should raise a clear error."""
+        returns = generate_garch_data(300)
+        with pytest.raises(ValueError, match="cov_type"):
+            GJRGARCHXEstimator(returns).estimate(cov_type="bogus")
+
+
+class TestParameterCaps:
+    """Test the relaxed / parameterised alpha and beta caps."""
+
+    def test_default_caps_relaxed(self):
+        """Default beta cap should be relaxed well above the old 0.95 hard cap."""
+        # Highly persistent series: beta wants to sit above 0.95.
+        np.random.seed(7)
+        n = 1500
+        omega, alpha, beta = 0.02, 0.06, 0.93
+        r = np.zeros(n)
+        v = np.zeros(n)
+        v[0] = omega / (1 - alpha - beta)
+        for t in range(1, n):
+            v[t] = omega + alpha * r[t - 1] ** 2 + beta * v[t - 1]
+            r[t] = np.sqrt(v[t]) * np.random.standard_t(df=6)
+        s = pd.Series(r, index=pd.date_range("2018-01-01", periods=n, freq="D"))
+
+        results = estimate_gjr_garch_x(s)
+        # With the old beta<=0.95 cap this would silently bind at 0.95.
+        assert results.converged
+        assert results.params["beta"] <= 0.999
+
+    def test_caps_are_configurable(self):
+        """alpha_max / beta_max kwargs should be honoured as upper bounds."""
+        returns = generate_garch_data(500)
+        results = estimate_gjr_garch_x(returns, alpha_max=0.2, beta_max=0.9)
+        assert results.params["alpha"] <= 0.2 + 1e-6
+        assert results.params["beta"] <= 0.9 + 1e-6
+
+    def test_invalid_caps_raise(self):
+        returns = generate_garch_data(300)
+        with pytest.raises(ValueError, match="alpha_max"):
+            GJRGARCHXEstimator(returns).estimate(alpha_max=1.5)
+        with pytest.raises(ValueError, match="beta_max"):
+            GJRGARCHXEstimator(returns).estimate(beta_max=1.0)
+
+
+class TestInputValidation:
+    """Test array-like coercion and exogenous-variable alignment checks."""
+
+    def test_accepts_numpy_array(self):
+        """A bare numpy array of returns should be coerced to a Series."""
+        returns = generate_garch_data(400).to_numpy()
+        results = estimate_gjr_garch_x(returns)
+        assert results.converged
+        assert results.n_obs == 400
+
+    def test_accepts_list(self):
+        """A Python list of returns should be coerced to a Series."""
+        returns = list(generate_garch_data(300).to_numpy())
+        results = estimate_gjr_garch_x(returns)
+        assert results.n_obs == 300
+
+    def test_exog_as_array(self):
+        """A bare exog array matching the return length should be accepted."""
+        returns = generate_garch_data(400)
+        exog = np.zeros(400)
+        exog[100:140] = 1.0
+        results = estimate_gjr_garch_x(returns, exog)
+        assert results.converged
+        assert "x0" in results.exog_effects
+
+    def test_exog_length_mismatch_raises(self):
+        """A bare exog array of the wrong length should raise informatively."""
+        returns = generate_garch_data(400)
+        exog = np.zeros(399)
+        with pytest.raises(ValueError, match="rows"):
+            estimate_gjr_garch_x(returns, exog)
+
+    def test_exog_index_misalignment_raises(self):
+        """A DataFrame exog that does not cover the returns index should raise."""
+        returns = generate_garch_data(400)
+        # Drop part of the exog index so it cannot cover all returns timestamps.
+        exog = pd.DataFrame({"D_event": np.zeros(400)}, index=returns.index)
+        exog = exog.iloc[:300]
+        with pytest.raises(ValueError, match="does not cover"):
+            estimate_gjr_garch_x(returns, exog)
+
+    def test_multidim_returns_raises(self):
+        """Multi-column returns input should raise a clear error."""
+        returns = generate_garch_data(300)
+        df = pd.DataFrame({"a": returns, "b": returns})
+        with pytest.raises(ValueError, match="one-dimensional|single"):
+            estimate_gjr_garch_x(df)
 
 
 if __name__ == "__main__":
