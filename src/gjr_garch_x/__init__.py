@@ -188,9 +188,11 @@ class GJRGARCHXResults:
         lines.append("")
         lines.append(f"Persistence (α + β + |γ|/2): {persistence:.4f}")
 
-        if 0 < persistence < 1:
+        if 0 < persistence < 0.9999:
             half_life = -np.log(0.5) / np.log(persistence)
             lines.append(f"Half-life of shocks:         {half_life:.1f} periods")
+        elif persistence >= 0.9999:
+            lines.append("Half-life of shocks:         ∞ (near unit root)")
 
         # Unconditional variance (if stationary)
         omega = self.params.get("omega", 0)

@@ -26,7 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now raise informative `ValueError`s instead of obscure `KeyError`s.
 - `CHANGELOG.md` (fixes the previously dead `[project.urls] Changelog` link).
 - Tests for the robust covariance, the `hessian` covariance, the coefficient caps,
-  and the input-validation paths (18 → 32 tests).
+  and the input-validation paths (18 → 34 tests).
+- **Near-unit-root half-life display (issue #8).** `summary()` now reports
+  `∞ (near unit root)` for the half-life of shocks when persistence
+  `α + β + |γ|/2 ≥ 0.9999`, instead of printing a misleadingly large finite value.
+  Merged from the parallel `origin/master` issue-fix branch.
 
 ### Changed
 
@@ -50,6 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   targets aligned to Python 3.10+.
 - Legacy `typing.Dict` / `List` / `Optional` / `Tuple` replaced with builtin generics
   and `X | None`. `ruff check` and `mypy` (strict `disallow_untyped_defs`) pass clean.
+- Reconciled with the parallel `origin/master` issue-fix branch (PRs #4/#6, issues
+  #5/#7/#8). The documentation (#5, `max_iter` in the API reference), Hessian-warning
+  (#7, the negative-variance `sqrt` guard), and mypy (#6) fixes from that branch are
+  superseded by this release's larger rewrite; the unique near-unit-root half-life
+  display (#8) is merged in (see *Added*). `ISSUES.md` from that branch is retained
+  for provenance.
 
 ## [0.1.0] - 2025-12-19
 

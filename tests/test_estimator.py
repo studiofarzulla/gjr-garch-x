@@ -199,6 +199,44 @@ class TestSummary:
         assert "converged" in repr_str
         assert "n_obs" in repr_str
 
+    @staticmethod
+    def _results_with_persistence(alpha: float, beta: float, gamma: float = 0.0):
+        """Build a minimal results container with a controlled persistence."""
+        vol = pd.Series(np.ones(10))
+        return GJRGARCHXResults(
+            converged=True,
+            params={"omega": 0.05, "alpha": alpha, "gamma": gamma, "beta": beta},
+            std_errors={},
+            pvalues={},
+            log_likelihood=-100.0,
+            aic=210.0,
+            bic=220.0,
+            volatility=vol,
+            residuals=pd.Series(np.zeros(10)),
+            exog_effects={},
+            event_effects={},
+            sentiment_effects={},
+            leverage_effect=gamma,
+            iterations=10,
+        )
+
+    def test_half_life_finite_for_stationary(self):
+        """A stationary persistence < 1 should report a finite half-life."""
+        results = self._results_with_persistence(alpha=0.05, beta=0.90)
+        summary = results.summary()
+
+        assert "Half-life of shocks:" in summary
+        assert "periods" in summary
+        assert "∞" not in summary
+
+    def test_half_life_infinite_near_unit_root(self):
+        """Persistence at/above the unit root should report an infinite half-life."""
+        results = self._results_with_persistence(alpha=0.10, beta=0.90)
+        summary = results.summary()
+
+        assert "Half-life of shocks:" in summary
+        assert "∞ (near unit root)" in summary
+
 
 class TestEdgeCases:
     """Test edge cases and error handling."""
