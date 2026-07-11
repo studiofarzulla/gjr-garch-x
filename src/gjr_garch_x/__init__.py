@@ -47,7 +47,9 @@ License: MIT
 from __future__ import annotations
 
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -55,7 +57,7 @@ from scipy.optimize import minimize
 from scipy.special import gammaln
 from scipy.stats import t as student_t
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __author__ = "Murad Farzulla"
 __email__ = "murad@farzulla.org"
 
@@ -63,11 +65,70 @@ __all__ = [
     "estimate_gjr_garch_x",
     "GJRGARCHXResults",
     "GJRGARCHXEstimator",
+    "HAVE_NUMBA",
     # Backwards compatibility aliases
     "estimate_tarch_x",
     "TARCHXResults",
     "TARCHXEstimator",
 ]
+
+# -----------------------------------------------------------------------------
+# Variance recursion core: numba-jitted when numba is importable, otherwise a
+# plain-Python scalar loop. Both execute the same operations in the same order,
+# so they produce identical numbers; numba only removes interpreter overhead
+# (roughly an order of magnitude on multi-thousand-observation series, which is
+# what makes repeated refits — multistart, bootstraps — tractable).
+# -----------------------------------------------------------------------------
+try:
+    from numba import njit
+
+    HAVE_NUMBA = True
+except Exception:  # pragma: no cover - depends on optional dependency
+    HAVE_NUMBA = False
+
+    def njit(*args: Any, **kwargs: Any) -> Callable[..., Any]:  # type: ignore[no-redef]
+        """No-op decorator standing in for numba.njit when numba is absent."""
+
+        def wrap(f: Callable[..., Any]) -> Callable[..., Any]:
+            return f
+
+        if args and callable(args[0]):
+            func: Callable[..., Any] = args[0]
+            return func
+        return wrap
+
+
+@njit(cache=True, fastmath=False)
+def _variance_recursion_core(
+    omega: float,
+    alpha: float,
+    gamma: float,
+    beta: float,
+    resid: np.ndarray,
+    exog_contrib: np.ndarray,
+    var0: float,
+) -> np.ndarray:
+    """
+    GJR-GARCH variance recursion.
+
+        σ²_t = ω + α·ε²_{t-1} + γ·ε²_{t-1}·I(ε_{t-1}<0) + β·σ²_{t-1} + (δ·x_t)
+
+    ``exog_contrib`` is the pre-computed per-t Σⱼ δⱼ·x_{j,t} (vectorised outside
+    the loop; only the σ²_{t-1} dependence is genuinely sequential). ``resid``
+    are the demeaned returns; ``var0`` initialises σ²_0.
+    """
+    n = resid.shape[0]
+    variance = np.empty(n)
+    variance[0] = var0
+    for t in range(1, n):
+        e = resid[t - 1]
+        eps_sq = e * e
+        lev = gamma * eps_sq if e < 0.0 else 0.0
+        v = omega + alpha * eps_sq + lev + beta * variance[t - 1] + exog_contrib[t]
+        if v < 1e-8:
+            v = 1e-8
+        variance[t] = v
+    return variance
 
 
 @dataclass
@@ -338,6 +399,12 @@ class GJRGARCHXEstimator:
         self.param_names = ["omega", "alpha", "gamma", "beta", "nu"] + self.exog_names
         self.n_params = 5 + self.n_exog
 
+        # Precompute the fixed pieces of the recursion (returns do not change
+        # over the estimator's lifetime; 0.2.0 recomputed these per LL call).
+        self._returns_array = self.returns.to_numpy(dtype=float)
+        self._resid_array = self._returns_array - float(self._returns_array.mean())
+        self._var0 = float(np.var(self._returns_array))
+
     @staticmethod
     def _coerce_exog(exog_vars: object, raw_index: pd.Index) -> pd.DataFrame:
         """Coerce exogenous regressors into an index-aligned float DataFrame."""
@@ -394,27 +461,21 @@ class GJRGARCHXEstimator:
         beta = params[3]
         deltas = params[5:]
 
-        variance = np.zeros(self.n_obs)
-        returns_arr = self.returns.to_numpy(dtype=float)
-        mean_return = float(returns_arr.mean())
-        residuals = returns_arr - mean_return
+        if self.has_exog:
+            exog_contrib = self._exog_array @ deltas
+        else:
+            exog_contrib = np.zeros(self.n_obs)
 
-        # Initialize with unconditional variance estimate
-        variance[0] = float(np.var(returns_arr))
-
-        for t in range(1, self.n_obs):
-            eps_sq_prev = residuals[t - 1] ** 2
-            leverage_term = gamma * eps_sq_prev * (residuals[t - 1] < 0)
-
-            v = omega + alpha * eps_sq_prev + leverage_term + beta * variance[t - 1]
-
-            if self.has_exog:
-                v += float(self._exog_array[t] @ deltas)
-
-            # Ensure positive variance
-            variance[t] = v if v > 1e-8 else 1e-8
-
-        return variance, residuals
+        variance = _variance_recursion_core(
+            float(omega),
+            float(alpha),
+            float(gamma),
+            float(beta),
+            self._resid_array,
+            exog_contrib,
+            self._var0,
+        )
+        return variance, self._resid_array
 
     def _loglik_contributions(self, params: np.ndarray) -> np.ndarray:
         """
@@ -437,7 +498,7 @@ class GJRGARCHXEstimator:
         contributions = (
             log_const
             - 0.5 * np.log(variance)
-            - ((nu + 1) / 2) * np.log(1.0 + std_residuals**2 / (nu - 2))
+            - ((nu + 1) / 2) * np.log1p(std_residuals**2 / (nu - 2))
         )
         return contributions
 
@@ -482,6 +543,176 @@ class GJRGARCHXEstimator:
             start_vals = np.append(start_vals, np.zeros(self.n_exog))
         return start_vals
 
+    @staticmethod
+    def _validate_estimate_args(
+        cov_type: str, alpha_max: float, beta_max: float
+    ) -> None:
+        """Validate the shared ``estimate``/``estimate_multistart`` arguments."""
+        if cov_type not in ("robust", "hessian"):
+            raise ValueError(
+                f"cov_type must be 'robust' or 'hessian', got {cov_type!r}."
+            )
+        if not 0 < alpha_max <= 1:
+            raise ValueError(f"alpha_max must be in (0, 1], got {alpha_max}.")
+        if not 0 < beta_max < 1:
+            raise ValueError(f"beta_max must be in (0, 1), got {beta_max}.")
+
+    def _garch_bounds(
+        self, alpha_max: float, beta_max: float
+    ) -> list[tuple[float | None, float | None]]:
+        """Optimizer bounds for [ω, α, γ, β, ν] plus unbounded exog coefficients."""
+        bounds: list[tuple[float | None, float | None]] = [
+            (1e-8, None),  # omega > 0
+            (1e-8, alpha_max),  # alpha
+            (-0.5, 0.5),  # gamma (leverage)
+            (1e-8, beta_max),  # beta
+            (2.1, 50),  # nu
+        ]
+        for _ in range(self.n_exog):
+            bounds.append((None, None))
+        return bounds
+
+    def _run_minimize(
+        self,
+        start_vals: np.ndarray,
+        method: str,
+        max_iter: int,
+        bounds: list[tuple[float | None, float | None]],
+    ) -> Any:
+        """One SLSQP (or other constrained) minimization from a given start."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return minimize(
+                fun=self._log_likelihood,
+                x0=start_vals,
+                method=method,
+                bounds=bounds,
+                constraints=self._parameter_constraints(),
+                options={"maxiter": max_iter, "disp": False},
+            )
+
+    def _multistart_values(self, n_starts: int, seed: int | None) -> list[np.ndarray]:
+        """
+        Default start plus ``n_starts - 1`` randomized starts.
+
+        The randomization scheme is deliberately identical to the research
+        estimator this port comes from (crypto-event-study ``tarch_x_fast``):
+        the same ``default_rng`` draw order, ranges, and stationarity-feasibility
+        repair, so seeded multistart fits reproduce that pipeline's numbers.
+        """
+        rng = np.random.default_rng(seed)
+        starts = [self._get_starting_values()]
+        sv = float(np.var(self._returns_array))
+        for _ in range(max(0, n_starts - 1)):
+            s = np.array(
+                [
+                    sv * rng.uniform(0.02, 0.30),  # omega
+                    rng.uniform(0.01, 0.15),  # alpha
+                    rng.uniform(-0.10, 0.20),  # gamma
+                    rng.uniform(0.70, 0.93),  # beta
+                    rng.uniform(3.0, 12.0),  # nu
+                ]
+            )
+            if self.n_exog:
+                s = np.append(s, rng.normal(0.0, 0.5, self.n_exog))
+            # enforce stationarity feasibility of the seed
+            if s[1] + s[3] + abs(s[2]) / 2 >= 0.999:
+                s[3] = 0.90 - s[1] - abs(s[2]) / 2
+            starts.append(s)
+        return starts
+
+    def _failed_results(self, cov_type: str) -> GJRGARCHXResults:
+        """Results container for a fit that raised instead of converging."""
+        return GJRGARCHXResults(
+            converged=False,
+            params={},
+            std_errors={},
+            pvalues={},
+            log_likelihood=np.nan,
+            aic=np.nan,
+            bic=np.nan,
+            volatility=pd.Series(dtype=float),
+            residuals=pd.Series(dtype=float),
+            exog_effects={},
+            event_effects={},
+            sentiment_effects={},
+            leverage_effect=np.nan,
+            iterations=0,
+            n_obs=0,
+            cov_type=cov_type,
+        )
+
+    def _build_results(
+        self,
+        optimal_params: np.ndarray,
+        neg_loglik: float,
+        converged: bool,
+        iterations: int,
+        cov_type: str,
+        compute_se: bool,
+        verbose: bool,
+    ) -> GJRGARCHXResults:
+        """Assemble a ``GJRGARCHXResults`` from an optimizer solution."""
+        param_dict = self._unpack_params(optimal_params)
+
+        variance, residuals = self._variance_recursion(optimal_params)
+        volatility = pd.Series(np.sqrt(variance), index=self.returns.index)
+        residuals_series = pd.Series(residuals, index=self.returns.index)
+
+        if compute_se:
+            std_errors, pvalues = self._compute_standard_errors(
+                optimal_params, cov_type=cov_type
+            )
+        else:
+            std_errors = dict.fromkeys(self.param_names, np.nan)
+            pvalues = dict.fromkeys(self.param_names, np.nan)
+
+        log_lik = -neg_loglik
+        aic = 2 * self.n_params - 2 * log_lik
+        bic = np.log(self.n_obs) * self.n_params - 2 * log_lik
+
+        # Classify exogenous effects
+        exog_effects = {}
+        event_effects = {}
+        sentiment_effects = {}
+
+        sentiment_keywords = {"sentiment", "gdelt", "tone", "mood", "fear", "greed"}
+
+        for name in self.exog_names:
+            name_lower = name.lower()
+            exog_effects[name] = param_dict[name]
+
+            if any(kw in name_lower for kw in sentiment_keywords):
+                sentiment_effects[name] = param_dict[name]
+            else:
+                event_effects[name] = param_dict[name]
+
+        if verbose:
+            status = "OK" if converged else "WARNING: Did not converge"
+            print(f"  [{status}] Iterations: {iterations}")
+            print(f"  Log-likelihood: {log_lik:.2f}")
+            print(f"  AIC: {aic:.2f}, BIC: {bic:.2f}")
+            print(f"  Std. errors: {cov_type if compute_se else 'skipped'}")
+
+        return GJRGARCHXResults(
+            converged=converged,
+            params=param_dict,
+            std_errors=std_errors,
+            pvalues=pvalues,
+            log_likelihood=log_lik,
+            aic=aic,
+            bic=bic,
+            volatility=volatility,
+            residuals=residuals_series,
+            exog_effects=exog_effects,
+            event_effects=event_effects,
+            sentiment_effects=sentiment_effects,
+            leverage_effect=param_dict["gamma"],
+            iterations=iterations,
+            n_obs=self.n_obs,
+            cov_type=cov_type,
+        )
+
     def estimate(
         self,
         method: str = "SLSQP",
@@ -490,6 +721,7 @@ class GJRGARCHXEstimator:
         cov_type: str = "robust",
         alpha_max: float = 0.99,
         beta_max: float = 0.999,
+        compute_se: bool = True,
     ) -> GJRGARCHXResults:
         """
         Estimate GJR-GARCH-X model via maximum likelihood.
@@ -514,130 +746,121 @@ class GJRGARCHXEstimator:
         beta_max : float, default 0.999
             Upper bound on the GARCH coefficient β. Relaxed from the historical
             hard cap of 0.95 for the same reason as ``alpha_max``.
+        compute_se : bool, default True
+            Compute standard errors and p-values. Set ``False`` for repeated
+            refits (multistart candidates, bootstrap draws) where only the point
+            estimates matter: the numerical Hessian costs hundreds of
+            log-likelihood evaluations per fit, dominating total runtime.
 
         Returns
         -------
         GJRGARCHXResults
             Estimation results container.
         """
-        if cov_type not in ("robust", "hessian"):
-            raise ValueError(
-                f"cov_type must be 'robust' or 'hessian', got {cov_type!r}."
-            )
-        if not 0 < alpha_max <= 1:
-            raise ValueError(f"alpha_max must be in (0, 1], got {alpha_max}.")
-        if not 0 < beta_max < 1:
-            raise ValueError(f"beta_max must be in (0, 1), got {beta_max}.")
+        self._validate_estimate_args(cov_type, alpha_max, beta_max)
 
         if verbose:
             print(f"Estimating GJR-GARCH-X with {self.n_exog} exogenous variables...")
 
         start_vals = self._get_starting_values()
-
-        bounds: list[tuple[float | None, float | None]] = [
-            (1e-8, None),  # omega > 0
-            (1e-8, alpha_max),  # alpha
-            (-0.5, 0.5),  # gamma (leverage)
-            (1e-8, beta_max),  # beta
-            (2.1, 50),  # nu
-        ]
-        # Exogenous coefficients are unbounded
-        for _ in range(self.n_exog):
-            bounds.append((None, None))
+        bounds = self._garch_bounds(alpha_max, beta_max)
 
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-
-                result = minimize(
-                    fun=self._log_likelihood,
-                    x0=start_vals,
-                    method=method,
-                    bounds=bounds,
-                    constraints=self._parameter_constraints(),
-                    options={"maxiter": max_iter, "disp": False},
-                )
-
+            result = self._run_minimize(start_vals, method, max_iter, bounds)
             converged = result.success and result.fun < 1e6
-            optimal_params = result.x
-            param_dict = self._unpack_params(optimal_params)
-
-            variance, residuals = self._variance_recursion(optimal_params)
-            volatility = pd.Series(np.sqrt(variance), index=self.returns.index)
-            residuals_series = pd.Series(residuals, index=self.returns.index)
-
-            std_errors, pvalues = self._compute_standard_errors(
-                optimal_params, cov_type=cov_type
+            return self._build_results(
+                result.x,
+                float(result.fun),
+                converged,
+                result.nit,
+                cov_type,
+                compute_se,
+                verbose,
             )
-
-            log_lik = -result.fun
-            aic = 2 * self.n_params - 2 * log_lik
-            bic = np.log(self.n_obs) * self.n_params - 2 * log_lik
-
-            # Classify exogenous effects
-            exog_effects = {}
-            event_effects = {}
-            sentiment_effects = {}
-
-            sentiment_keywords = {"sentiment", "gdelt", "tone", "mood", "fear", "greed"}
-
-            for name in self.exog_names:
-                name_lower = name.lower()
-                exog_effects[name] = param_dict[name]
-
-                if any(kw in name_lower for kw in sentiment_keywords):
-                    sentiment_effects[name] = param_dict[name]
-                else:
-                    event_effects[name] = param_dict[name]
-
-            if verbose:
-                status = "OK" if converged else "WARNING: Did not converge"
-                print(f"  [{status}] Iterations: {result.nit}")
-                print(f"  Log-likelihood: {log_lik:.2f}")
-                print(f"  AIC: {aic:.2f}, BIC: {bic:.2f}")
-                print(f"  Std. errors: {cov_type}")
-
-            return GJRGARCHXResults(
-                converged=converged,
-                params=param_dict,
-                std_errors=std_errors,
-                pvalues=pvalues,
-                log_likelihood=log_lik,
-                aic=aic,
-                bic=bic,
-                volatility=volatility,
-                residuals=residuals_series,
-                exog_effects=exog_effects,
-                event_effects=event_effects,
-                sentiment_effects=sentiment_effects,
-                leverage_effect=param_dict["gamma"],
-                iterations=result.nit,
-                n_obs=self.n_obs,
-                cov_type=cov_type,
-            )
-
         except Exception as e:
             if verbose:
                 print(f"  [FAIL] Estimation failed: {e}")
+            return self._failed_results(cov_type)
 
-            return GJRGARCHXResults(
-                converged=False,
-                params={},
-                std_errors={},
-                pvalues={},
-                log_likelihood=np.nan,
-                aic=np.nan,
-                bic=np.nan,
-                volatility=pd.Series(dtype=float),
-                residuals=pd.Series(dtype=float),
-                exog_effects={},
-                event_effects={},
-                sentiment_effects={},
-                leverage_effect=np.nan,
-                iterations=0,
-                n_obs=0,
-                cov_type=cov_type,
+    def estimate_multistart(
+        self,
+        n_starts: int = 5,
+        seed: int | None = None,
+        method: str = "SLSQP",
+        max_iter: int = 2000,
+        verbose: bool = False,
+        cov_type: str = "robust",
+        alpha_max: float = 0.99,
+        beta_max: float = 0.999,
+        compute_se: bool = True,
+    ) -> GJRGARCHXResults:
+        """
+        Multistart maximum-likelihood estimation.
+
+        Runs the optimizer from the default starting values plus ``n_starts - 1``
+        seeded random starts and keeps the solution with the best (lowest)
+        negative log-likelihood. GJR-GARCH-X likelihoods with several exogenous
+        regressors are multimodal enough that a single default start can land on
+        an inferior local optimum; multistart is the standard mitigation.
+
+        Parameters
+        ----------
+        n_starts : int, default 5
+            Total number of starts (the default start plus ``n_starts - 1``
+            randomized ones). ``n_starts=1`` is equivalent to :meth:`estimate`
+            with ``max_iter`` as given.
+        seed : int or None, default None
+            Seed for the start-value RNG. Fixing it makes the whole multistart
+            fit deterministic.
+        method, max_iter, verbose, cov_type, alpha_max, beta_max, compute_se
+            As in :meth:`estimate`. Note ``max_iter`` defaults to 2000 here
+            (matching the research pipeline this port comes from), not 1000.
+
+        Returns
+        -------
+        GJRGARCHXResults
+            Results at the best optimum found. ``converged`` is True if at
+            least one start converged successfully; the reported solution is
+            the best-likelihood one across all starts (which is the converged
+            optimum in all non-pathological cases).
+        """
+        self._validate_estimate_args(cov_type, alpha_max, beta_max)
+
+        if verbose:
+            print(
+                f"Estimating GJR-GARCH-X with {self.n_exog} exogenous variables "
+                f"({n_starts} starts)..."
             )
+
+        bounds = self._garch_bounds(alpha_max, beta_max)
+        starts = self._multistart_values(n_starts, seed)
+
+        best: Any = None
+        any_ok = False
+        for s in starts:
+            try:
+                result = self._run_minimize(s, method, max_iter, bounds)
+            except Exception:
+                continue
+            ok = bool(result.success) and result.fun < 1e6
+            any_ok = any_ok or ok
+            if best is None or result.fun < best.fun:
+                best = result
+
+        if best is None:
+            if verbose:
+                print("  [FAIL] All starts failed.")
+            return self._failed_results(cov_type)
+
+        return self._build_results(
+            best.x,
+            float(best.fun),
+            any_ok,
+            best.nit,
+            cov_type,
+            compute_se,
+            verbose,
+        )
 
     def _compute_standard_errors(
         self, params: np.ndarray, cov_type: str = "robust"
@@ -814,6 +1037,9 @@ def estimate_gjr_garch_x(
     cov_type: str = "robust",
     alpha_max: float = 0.99,
     beta_max: float = 0.999,
+    compute_se: bool = True,
+    n_starts: int = 1,
+    seed: int | None = None,
 ) -> GJRGARCHXResults:
     """
     Estimate GJR-GARCH-X model with exogenous variance regressors.
@@ -843,6 +1069,17 @@ def estimate_gjr_garch_x(
         Upper bound on the ARCH coefficient α (see :meth:`GJRGARCHXEstimator.estimate`).
     beta_max : float, default 0.999
         Upper bound on the GARCH coefficient β.
+    compute_se : bool, default True
+        Compute standard errors and p-values. Set ``False`` for repeated refits
+        where only point estimates matter (the numerical Hessian dominates
+        runtime).
+    n_starts : int, default 1
+        Number of optimizer starts. ``1`` runs a single fit from the default
+        starting values; larger values dispatch to
+        :meth:`GJRGARCHXEstimator.estimate_multistart` with a deterministic
+        seeded randomization of the extra starts.
+    seed : int or None, default None
+        Seed for the multistart start-value RNG (ignored when ``n_starts=1``).
 
     Returns
     -------
@@ -886,6 +1123,18 @@ def estimate_gjr_garch_x(
     Econometric Reviews, 11(2), 143-172.
     """
     estimator = GJRGARCHXEstimator(returns, exog_vars)
+    if n_starts > 1:
+        return estimator.estimate_multistart(
+            n_starts=n_starts,
+            seed=seed,
+            method=method,
+            max_iter=max_iter,
+            verbose=verbose,
+            cov_type=cov_type,
+            alpha_max=alpha_max,
+            beta_max=beta_max,
+            compute_se=compute_se,
+        )
     return estimator.estimate(
         method=method,
         max_iter=max_iter,
@@ -893,6 +1142,7 @@ def estimate_gjr_garch_x(
         cov_type=cov_type,
         alpha_max=alpha_max,
         beta_max=beta_max,
+        compute_se=compute_se,
     )
 
 

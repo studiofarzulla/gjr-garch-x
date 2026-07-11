@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gjr-garch-x"
-version = "0.2.0"
+version = "0.3.0"
 description = "GJR-GARCH models with exogenous regressors in the variance equation"
 readme = "README.md"
 license = {text = "MIT"}
@@ -50,6 +50,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+speed = [
+    "numba>=0.59",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
@@ -113,6 +116,10 @@ follow_imports_for_stubs = true
 
 [[tool.mypy.overrides]]
 module = ["pandas", "pandas.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["numba", "numba.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

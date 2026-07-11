@@ -5,6 +5,40 @@ All notable changes to `gjr-garch-x` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-11
+
+### Added
+
+- **Multistart estimation.** `GJRGARCHXEstimator.estimate_multistart(n_starts, seed, ...)`
+  and `estimate_gjr_garch_x(..., n_starts=, seed=)`: the optimizer is run from the
+  default starting values plus `n_starts - 1` seeded random starts and the
+  best-likelihood solution is kept. The randomization scheme (draw order, ranges,
+  stationarity-feasibility repair) is identical to the `tarch_x_fast` research
+  estimator in the [crypto-event-study](https://github.com/studiofarzulla/crypto-event-study)
+  pipeline, so seeded fits reproduce that pipeline's numbers.
+- **Optional numba acceleration.** The variance recursion is extracted into a
+  module-level core that is `@njit`-compiled when `numba` is importable and falls
+  back to the identical pure-Python loop otherwise. Install with
+  `pip install gjr-garch-x[speed]` to enable; `gjr_garch_x.HAVE_NUMBA` reports
+  which path is active. Numbers are identical either way; numba removes
+  interpreter overhead (roughly an order of magnitude on multi-thousand-observation
+  series), which is what makes repeated refits (multistart, bootstrap) tractable.
+- **`compute_se` flag** on `estimate` / `estimate_multistart` /
+  `estimate_gjr_garch_x`. `compute_se=False` skips the numerical-Hessian
+  standard-error step (hundreds of log-likelihood evaluations per fit) and returns
+  NaN `std_errors`/`pvalues` — the fast path for bootstrap refits where only point
+  estimates matter.
+
+### Changed
+
+- The fixed inputs of the recursion (returns array, demeaned residuals, initial
+  variance) are precomputed once at construction instead of per log-likelihood
+  call, and `log1p` replaces `log(1 + x)` in the Student-t log-likelihood.
+  Estimates are unchanged to numerical tolerance; the likelihood algebra now
+  matches the `tarch_x_fast` research estimator operation-for-operation.
+- `estimate()` internals refactored into reusable minimize/build steps shared with
+  the new multistart path. Public behavior is unchanged.
+
 ## [0.2.0] - 2026-06-27
 
 ### Added

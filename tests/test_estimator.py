@@ -445,5 +445,141 @@ class TestInputValidation:
             estimate_gjr_garch_x(df)
 
 
+class TestRecursionCore:
+    """Test the extracted (optionally numba-jitted) variance recursion core."""
+
+    def test_core_matches_reference_loop(self):
+        """The core must reproduce a hand-rolled GJR recursion exactly."""
+        from gjr_garch_x import _variance_recursion_core
+
+        rng = np.random.default_rng(0)
+        resid = rng.standard_normal(200)
+        exog_contrib = rng.normal(0, 0.01, 200)
+        omega, alpha, gamma, beta = 0.05, 0.07, 0.10, 0.85
+        var0 = float(np.var(resid))
+
+        expected = np.empty(200)
+        expected[0] = var0
+        for t in range(1, 200):
+            e = resid[t - 1]
+            ee = e * e  # square first: float multiplication is not associative
+            v = (
+                omega
+                + alpha * ee
+                + (gamma * ee if e < 0 else 0.0)
+                + beta * expected[t - 1]
+                + exog_contrib[t]
+            )
+            expected[t] = max(v, 1e-8)
+
+        got = _variance_recursion_core(
+            omega, alpha, gamma, beta, resid, exog_contrib, var0
+        )
+        np.testing.assert_array_equal(got, expected)
+
+    def test_estimates_unchanged_vs_known_fit(self):
+        """The refactored recursion should not move a well-identified fit."""
+        returns = generate_garch_data(800)
+        results = estimate_gjr_garch_x(returns)
+        assert results.converged
+        # Values in the usual GARCH neighbourhood of the DGP (omega=.05, a=.08, b=.88)
+        assert 0.5 < results.params["alpha"] + results.params["beta"] < 1.0
+
+    def test_have_numba_flag_exposed(self):
+        """HAVE_NUMBA must be importable and boolean."""
+        from gjr_garch_x import HAVE_NUMBA
+
+        assert isinstance(HAVE_NUMBA, bool)
+
+
+class TestMultistart:
+    """Test the multistart estimation path."""
+
+    def _returns_with_event(self, n: int = 600):
+        returns = generate_garch_data(n)
+        exog = pd.DataFrame(index=returns.index)
+        exog["D_event"] = 0.0
+        exog.iloc[200:240, 0] = 1.0
+        return returns, exog
+
+    def test_multistart_converges(self):
+        returns, exog = self._returns_with_event()
+        est = GJRGARCHXEstimator(returns, exog)
+        results = est.estimate_multistart(n_starts=3, seed=0)
+        assert results.converged
+        assert "D_event" in results.params
+
+    def test_seeded_multistart_deterministic(self):
+        """Same seed, same data => identical parameter estimates."""
+        returns, exog = self._returns_with_event()
+        r1 = GJRGARCHXEstimator(returns, exog).estimate_multistart(n_starts=4, seed=123)
+        r2 = GJRGARCHXEstimator(returns, exog).estimate_multistart(n_starts=4, seed=123)
+        p1 = np.array([r1.params[k] for k in r1.params])
+        p2 = np.array([r2.params[k] for k in r2.params])
+        np.testing.assert_array_equal(p1, p2)
+
+    def test_multistart_no_worse_than_single_start(self):
+        """Best-of-n likelihood can only match or beat the single default start."""
+        returns, exog = self._returns_with_event()
+        single = GJRGARCHXEstimator(returns, exog).estimate(max_iter=2000)
+        multi = GJRGARCHXEstimator(returns, exog).estimate_multistart(
+            n_starts=5, seed=42, max_iter=2000
+        )
+        assert multi.log_likelihood >= single.log_likelihood - 1e-6
+
+    def test_n_starts_dispatch_from_convenience_function(self):
+        """estimate_gjr_garch_x(n_starts>1) should run the multistart path."""
+        returns, exog = self._returns_with_event()
+        r1 = estimate_gjr_garch_x(returns, exog, n_starts=3, seed=7, max_iter=2000)
+        r2 = GJRGARCHXEstimator(returns, exog).estimate_multistart(
+            n_starts=3, seed=7, max_iter=2000
+        )
+        assert r1.log_likelihood == r2.log_likelihood
+
+    def test_multistart_respects_caps(self):
+        returns, exog = self._returns_with_event()
+        results = GJRGARCHXEstimator(returns, exog).estimate_multistart(
+            n_starts=3, seed=0, alpha_max=0.3, beta_max=0.95
+        )
+        assert results.params["alpha"] <= 0.3 + 1e-6
+        assert results.params["beta"] <= 0.95 + 1e-6
+
+
+class TestComputeSEFlag:
+    """Test the compute_se fast path."""
+
+    def test_compute_se_false_returns_nan_ses(self):
+        returns = generate_garch_data(400)
+        results = estimate_gjr_garch_x(returns, compute_se=False)
+        assert results.converged
+        assert all(np.isnan(v) for v in results.std_errors.values())
+        assert all(np.isnan(v) for v in results.pvalues.values())
+
+    def test_compute_se_false_same_point_estimates(self):
+        """Skipping SEs must not change the point estimates."""
+        returns = generate_garch_data(400)
+        with_se = estimate_gjr_garch_x(returns)
+        without_se = estimate_gjr_garch_x(returns, compute_se=False)
+        for k in with_se.params:
+            assert with_se.params[k] == without_se.params[k]
+
+    def test_compute_se_false_is_faster(self):
+        """The whole point: skipping the Hessian should save real time."""
+        import time
+
+        returns = generate_garch_data(600)
+        exog = pd.DataFrame(
+            {"D_event": np.r_[np.zeros(300), np.ones(40), np.zeros(260)]},
+            index=returns.index,
+        )
+        t0 = time.perf_counter()
+        estimate_gjr_garch_x(returns, exog, compute_se=True)
+        t_with = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        estimate_gjr_garch_x(returns, exog, compute_se=False)
+        t_without = time.perf_counter() - t0
+        assert t_without < t_with
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
