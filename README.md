@@ -7,7 +7,7 @@
 
 **GJR-GARCH models with exogenous regressors in the variance equation.**
 
-A pure Python implementation of Glosten-Jagannathan-Runkle (1993) GARCH models that properly supports exogenous variables in the conditional variance equation—a feature missing from standard econometrics packages.
+A pure Python implementation of Glosten-Jagannathan-Runkle (1993) GARCH models that properly supports exogenous variables in the conditional variance equation—a feature missing from standard econometrics packages. It is the estimation engine behind [robust-eventstudy](https://github.com/studiofarzulla/robust-eventstudy), a dependence-robust inference toolkit for event studies.
 
 ## Why This Package?
 
@@ -249,16 +249,18 @@ If you use this package in academic work, please cite:
 }
 ```
 
-For the research paper that motivated this implementation:
+For the research paper that motivated this implementation (under review at
+*Digital Finance*):
 
 ```bibtex
-@techreport{farzulla2025infrastructure,
+@techreport{farzulla2026multimoment,
   author = {Farzulla, Murad},
-  title = {Market Reaction Asymmetry: Infrastructure Disruption Dominance
-           Over Regulatory Uncertainty in Cryptocurrency Markets},
-  year = {2025},
-  type = {Working Paper},
-  doi = {10.2139/ssrn.5788082}
+  title = {Do Cryptocurrency Markets Differentiate Infrastructure from
+           Regulatory Shocks? A Multi-Moment Event Study with
+           Dependence-Robust Inference},
+  year = {2026},
+  type = {Preprint},
+  doi = {10.21203/rs.3.rs-8323026/v1}
 }
 ```
 
